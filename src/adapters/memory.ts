@@ -1,5 +1,5 @@
 import { detectServerless } from "../limiter.js";
-import type { Storage } from "../types.js";
+import type { CounterState, Storage } from "../types.js";
 
 export interface MemoryOptions {
   /**
@@ -10,20 +10,9 @@ export interface MemoryOptions {
   allowInServerless?: boolean;
 }
 
-/**
- * In-process storage. Multiserver-correct ONLY within a single long-running
- * process (per-key async mutex closes the await-interleave window). Throws in a
- * detected serverless runtime unless explicitly allowed.
- *
- * TODO(RL-1): implement the Map<string, CounterState> store + a per-key async
- * mutex so concurrent transition() calls on the same key serialize. Set
- * kind="memory", distributed=false, raw=the Map.
- *
- * TODO(RL-4): wire the loud-failure guard below into the Limiter constructor too.
- */
 export function memory(
   opts: MemoryOptions = {},
-): Storage<Map<string, unknown>> {
+): Storage<Map<string, CounterState>> {
   const serverless = detectServerless();
   if (serverless && !opts.allowInServerless) {
     throw new Error(
@@ -40,5 +29,47 @@ export function memory(
       ].join("\n"),
     );
   }
-  throw new Error("not implemented: memory() store (RL-1)");
+
+  const state = new Map<string, CounterState>();
+  const locks = new Map<string, Promise<void>>();
+
+  async function locked<T>(key: string, run: () => T | Promise<T>): Promise<T> {
+    const previous = locks.get(key) ?? Promise.resolve();
+    let release = () => {};
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const tail = previous.then(
+      () => current,
+      () => current,
+    );
+    locks.set(key, tail);
+    await previous.catch(() => undefined);
+
+    try {
+      return await run();
+    } finally {
+      release();
+      if (locks.get(key) === tail) locks.delete(key);
+    }
+  }
+
+  return {
+    kind: "memory",
+    distributed: false,
+    raw: state,
+    transition(key, step) {
+      return locked(key, () => {
+        const prev = state.get(key) ?? null;
+        const { next, result } = step(prev, Date.now());
+        state.set(key, next);
+        return result;
+      });
+    },
+    async reset(key) {
+      await locked(key, () => {
+        state.delete(key);
+      });
+    },
+  };
 }

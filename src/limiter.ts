@@ -20,16 +20,27 @@ export function detectServerless(): string | null {
  * keys, calls the atomic transition, and shapes the public result.
  */
 export class Limiter<TReq = unknown> {
-  // TODO(RL-1): store opts, run the serverless guard (see RL-4), expose limit().
-  constructor(_opts: LimiterOptions<TReq>) {
-    throw new Error("not implemented: Limiter (RL-1, guard in RL-4)");
+  private readonly opts: LimiterOptions<TReq>;
+  private readonly prefix: string;
+
+  constructor(opts: LimiterOptions<TReq>) {
+    this.opts = opts;
+    this.prefix = opts.prefix ?? "rl";
   }
 
   /**
    * Consume one token for `idOrReq`. If a `key` resolver was configured, pass a
    * request; otherwise pass the raw id string.
    */
-  async limit(_idOrReq: TReq | string): Promise<RateLimitResult> {
-    throw new Error("not implemented: Limiter.limit (RL-1)");
+  async limit(idOrReq: TReq | string): Promise<RateLimitResult> {
+    const id = this.opts.key ? this.opts.key(idOrReq as TReq) : String(idOrReq);
+    const key = `${this.prefix}:${id}`;
+    const result = await this.opts.storage.transition(
+      key,
+      this.opts.limit.step(Date.now()),
+    );
+
+    this.opts.onResult?.(key, result);
+    return result;
   }
 }
