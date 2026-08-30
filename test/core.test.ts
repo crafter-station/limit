@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { memory } from "../src/adapters/memory.js";
-import { tokenBucket } from "../src/algorithms.js";
+import { fixedWindow, tokenBucket } from "../src/algorithms.js";
 import { casLoop, RateLimitConflictError } from "../src/cas-loop.js";
 import { Limiter } from "../src/limiter.js";
 import type { CounterState } from "../src/types.js";
@@ -24,6 +24,32 @@ describe("tokenBucket", () => {
     expect(denied.result.success).toBe(false);
     expect(refilled.result.success).toBe(true);
     expect(first.ttlMs).toBe(200);
+  });
+});
+
+describe("fixedWindow", () => {
+  test("resets after the configured window", () => {
+    const step = fixedWindow(2, "100ms").step(1_000);
+    const first = step(null, 1_000);
+    const second = step(first.next, 1_000);
+    const denied = step(second.next, 1_000);
+    const reset = step(denied.next, 1_100);
+
+    expect(first.result.success).toBe(true);
+    expect(second.result.success).toBe(true);
+    expect(denied.result.success).toBe(false);
+    expect(reset.result).toEqual({
+      success: true,
+      remaining: 1,
+      reset: 1_200,
+      limit: 2,
+    });
+    expect(step.recipe).toEqual({
+      kind: "fixed-window",
+      limit: 2,
+      now: 1_000,
+      windowMs: 100,
+    });
   });
 });
 

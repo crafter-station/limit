@@ -1,7 +1,11 @@
 import { defineConfig } from "tsup";
 
 export default defineConfig({
-  entry: ["src/index.ts", "src/adapters/memory.ts", "src/adapters/redis.ts"],
+  entry: [
+    "src/index.ts",
+    "src/adapters/memory.ts",
+    "src/adapters/neon-http.ts",
+  ],
   format: ["esm"],
   dts: true,
   clean: true,
@@ -9,5 +13,5 @@ export default defineConfig({
   splitting: false,
   sourcemap: true,
   target: "es2022",
-  external: ["ioredis"],
+  external: ["@neondatabase/serverless"],
 });

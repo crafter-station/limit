@@ -1,4 +1,4 @@
-import type { Algorithm, CounterState, Duration } from "./types.js";
+import type { Algorithm, CounterState, Duration, Step } from "./types.js";
 
 const UNIT_MS: Record<string, number> = {
   ms: 1,
@@ -50,7 +50,57 @@ export function tokenBucket(tokens: number, window: Duration): Algorithm {
   return {
     limit: tokens,
     step(now: number) {
-      return (prev, transitionNow = now) => reduce(prev, transitionNow);
+      return Object.assign(
+        (prev: CounterState | null, transitionNow = now) =>
+          reduce(prev, transitionNow),
+        {
+          recipe: {
+            kind: "token-bucket",
+            limit: tokens,
+            now,
+            windowMs,
+          } as const,
+        },
+      );
     },
+  };
+}
+
+export function fixedWindow(requests: number, window: Duration): Algorithm {
+  const windowMs = parseDuration(window);
+  if (!Number.isSafeInteger(requests) || requests <= 0) {
+    throw new Error(`invalid request limit: ${requests}`);
+  }
+
+  const makeStep = (now: number): Step =>
+    Object.assign(
+      (prev: CounterState | null, transitionNow = now) => {
+        const expired = !prev || prev.ts + windowMs <= transitionNow;
+        const windowStartedAt = expired ? transitionNow : prev.ts;
+        const count = expired ? 1 : Math.min(prev.count + 1, requests + 1);
+        return {
+          next: { count, ts: windowStartedAt },
+          result: {
+            success: count <= requests,
+            remaining: Math.max(0, requests - count),
+            reset: windowStartedAt + windowMs,
+            limit: requests,
+          },
+          ttlMs: windowMs * 2,
+        };
+      },
+      {
+        recipe: {
+          kind: "fixed-window",
+          limit: requests,
+          now,
+          windowMs,
+        } as const,
+      },
+    );
+
+  return {
+    limit: requests,
+    step: makeStep,
   };
 }

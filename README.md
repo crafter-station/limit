@@ -1,49 +1,79 @@
 # @crafter/limit
 
-Agent-first rate limiting. Limit once, run anywhere.
+Rate limiting on storage you already run.
 
-The rate limiter for the agent era: budget per **agent**, not per IP. When the
-caller is an MCP server fanning out or a Claude session hammering your endpoint,
-an IP means nothing. `@crafter/limit` keys on the agent and counts correctly
-across every server instance, on any storage you already run.
+The first production adapter targets Neon HTTP: one atomic SQL statement per decision, no Redis, no pool, no interactive transaction, and no runtime cleanup timer.
 
-```ts
-import { Limiter, tokenBucket, by } from "@crafter/limit";
-import { redis } from "@crafter/limit/redis";
+## Install
 
-const limiter = new Limiter({
-  storage: redis({ url: process.env.REDIS_URL! }),
-  limit: tokenBucket(10, "10s"),
-  key: by.agent, // the differentiator. default: by.ip
-});
-
-const { success, remaining, reset, limit } = await limiter.limit(agentId);
-if (!success) return new Response("rate limited", { status: 429 });
+```bash
+bun add @crafter/limit @neondatabase/serverless
 ```
 
-## Why
+## Migrate
 
-- **BYO storage.** Unlike `@upstash/ratelimit` (which ties you to their Redis
-  HTTP client), this accepts any backend through one small adapter interface.
-  Swap `redis()` for `memory()` for `dynamodb()` and your call sites never change.
-- **Agent-first.** `by.agent` is a first-class citizen. Per-agent budgets, not
-  per-IP — the abuse vector nobody else models.
-- **Correct by construction.** One atomic primitive per adapter. No
-  read-then-write, so no multiserver race. A single shared CAS loop is the only
-  race logic in the library.
-- **Loud when wrong.** `memory()` throws at boot in a serverless runtime instead
-  of silently letting `limit × instances` requests through.
+Apply this through your normal migration system:
 
-## Status
+```sql
+CREATE TABLE IF NOT EXISTS public.crafter_rate_limits (
+  key text PRIMARY KEY,
+  count bigint NOT NULL,
+  window_started_at bigint NOT NULL,
+  expires_at bigint NOT NULL
+);
 
-`v0.1` in progress. Scaffold + typed contracts landed; implementation lands via
-slices RL-1..RL-5. See `PRD.md`.
+CREATE INDEX IF NOT EXISTS crafter_rate_limits_expires_at_idx
+  ON public.crafter_rate_limits (expires_at);
+```
 
-| Ships | |
-|---|---|
-| v0.1 | `Limiter` + `tokenBucket` + `memory()` + `redis()` + `by.*` + serverless guard |
-| v0.2 | `slidingWindow` + `fixedWindow` + presets + framework middleware |
-| v0.3+ | `postgres()`, `dynamodb()`, `durableObject()` adapters |
+The adapter also exposes the same statements as `storage.migration` for migration tooling and isolated tests. It never executes DDL during a request.
+
+## Use Neon HTTP
+
+```ts
+import { neon } from "@neondatabase/serverless";
+import { fixedWindow, Limiter } from "@crafter/limit";
+import { neonHttp } from "@crafter/limit/neon";
+
+const sql = neon(process.env.DATABASE_URL!);
+
+const storage = neonHttp({
+  client: sql,
+  failureMode: "open",
+});
+
+const limiter = new Limiter({
+  storage,
+  limit: fixedWindow(10, "1m"),
+  prefix: "feedback",
+});
+
+const result = await limiter.limit(userId);
+```
+
+`result` contains `success`, `remaining`, `reset`, and `limit`.
+
+## Failure policy
+
+`failureMode` defaults to `"closed"`, which propagates storage failures. Use `"open"` when product availability is more important than enforcing the limit during a database incident. `onError` receives failures in either mode for observability.
+
+## Cleanup
+
+Expired rows do not affect decisions. Delete them explicitly from a cron or maintenance job:
+
+```ts
+await storage.clearExpired();
+```
+
+The adapter never starts timers or background workers.
+
+## Boundaries
+
+Use Postgres-backed limits for authenticated actions, admin operations, and expensive mutations already coupled to the database. Keep high-volume anonymous traffic at the CDN or WAF layer so every asset request does not become a database write.
+
+## Other storage
+
+`@crafter/limit/memory` is available for tests and long-lived single-process applications. It refuses to start in detected serverless runtimes unless explicitly acknowledged.
 
 ## License
 
