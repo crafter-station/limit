@@ -1,142 +1,87 @@
 ---
 type: shaping
 created: 2026-05-30
-status: shaped
+updated: 2026-08-30
+status: selected
 org: crafter-station
-themes: [rate-limiting, agent-first, sdk, oss]
+selected_shape: C
 ---
 
-# ratelimit-sdk — Agent-first rate limiting, BYO storage
+# @crafter/limit
 
-## One-liner
+## Source
 
-The simplest SDK for rate limiting so you can forget about it, agnostic to every
-platform. The `@upstash/ratelimit` competitor whose differentiator is **BYO
-storage** + **agent-first keying** (budgets per agent, not per IP).
+> fuck como podemos hacer para tener uno persistente no depender de upstash y que siempre este up y sea ultrabarato?
 
-## Why this exists
+> existe un adaptador para neon para hacer ratelimit barato? capaz eso puede ser un buen project open source dogfoodeable par acrafter station
 
-- **Upstash** has the DX but ties you to *their* Redis client (the constructor
-  takes `@upstash/redis`, an HTTP REST client; a normal Redis won't fit). It is
-  de-facto vendor-locked.
-- **Unkey** is the hosted product (pivoted to stateful Go servers Dec 2025) —
-  not "just an SDK", it's infra you depend on.
-- **Files SDK** (files-sdk.dev) proved the pattern for storage: "Write once,
-  store anywhere", single-import, adapter-as-function, identical call sites,
-  escape hatch. This is the same product, applied to rate limiting.
-- **The gap nobody filled**: rate limiting where the caller is an *agent*
-  (MCP server fan-out, a Claude session hammering an endpoint), not a human IP.
-  Connects to [[pattern_agent_first]] and [[pattern_selfish_source]] — build for
-  Hunter's own stack (Kai swarm, agent-first CLIs) first, package after.
+> listo hagamoslo asi go
 
-## Positioning
+## Requirements
 
-**Agent-first rate limiting.** "Rate limiting for the agent era: budgets per
-agent, not per IP." Base technical story: runs on any storage. Hook: `by.agent`
-as a first-class citizen, which neither Upstash nor Unkey model.
+| Req | Requirement | Status |
+|---|---|---|
+| R0 | Persist distributed rate-limit state without adopting Redis | Core goal |
+| R1 | Consume a limit with one atomic storage operation | Must-have |
+| R2 | Remain exact under concurrent requests | Must-have |
+| R3 | Require no pool, interactive transaction, or runtime timer on Neon HTTP | Must-have |
+| R4 | Work in Next.js, Vercel, Bun, Node.js, and edge-compatible runtimes | Must-have |
+| R5 | Never create or migrate tables during a request | Must-have |
+| R6 | Expose explicit fail-open and fail-closed policies | Must-have |
+| R7 | Return `success`, `remaining`, `reset`, and `limit` | Must-have |
+| R8 | Support isolated integration tests against real Neon branches | Must-have |
+| R9 | Keep public high-volume edge limiting outside Postgres | Must-have |
+| R10 | Ship flexible fixed window in the first release | Must-have |
+| R11 | Preserve a storage-agnostic core for later adapters | Must-have |
+| R12 | Add agent identity, Redis, and additional algorithms only after dogfooding | Nice-to-have |
 
-## Architecture decision: hybrid B-core + C-surface
+## C: BYO storage with Neon HTTP first
 
-Chosen after a 3-shape "Design It Twice" pass (2026-05-30). All three shapes
-independently converged on: **algorithm lives in core, adapter only counts
-atomically; one atomic primitive in the Storage interface; CounterState is an
-opaque pair of numbers.** That foundation is settled.
+| Part | Mechanism | Flagged |
+|---|---|---|
+| C1 | `Limiter` composes one algorithm and one storage adapter | No |
+| C2 | `fixedWindow()` provides a pure reducer plus a serializable transition recipe | No |
+| C3 | `neonHttp()` executes the recipe as one atomic `INSERT ... ON CONFLICT ... RETURNING` query | No |
+| C4 | `memory()` executes the same reducer under a per-key lock | No |
+| C5 | Schema statements are exposed for migrations but never run automatically | No |
+| C6 | `failureMode` selects explicit open or closed behavior | No |
+| C7 | `clearExpired()` is invoked by maintenance tooling, never a runtime timer | No |
+| C8 | Petdex uses Neon for authenticated and admin actions, while WAF handles anonymous public traffic | Yes: separate deployment slice |
 
-The divergence was *where the algorithm math runs*. Decision:
+## Fit Check
 
-### Core (from Shape B — correctness-first)
-- **`Step` reducer**: a pure function `(prev: CounterState | null, now) =>
-  { next, result, ttlMs }`. This IS the entire algorithm. No I/O, `now`
-  injected for testability.
-- **`casLoop` helper in core**: the ONLY race-handling logic in the whole
-  library, written once. Adapters that can't run server-side scripts (DynamoDB,
-  Postgres) plug their load + conditional-commit ops into it. Redis takes a
-  1-round-trip Lua fast path as a special case.
-- **One `Storage` primitive**: `transition(key, step) => Promise<RateLimitResult>`.
-  Atomic read-modify-write per key. No generic get/set (that's the race).
+| Req | Requirement | Status | C |
+|---|---|---|---|
+| R0 | Persist distributed rate-limit state without adopting Redis | Core goal | ✅ |
+| R1 | Consume a limit with one atomic storage operation | Must-have | ✅ |
+| R2 | Remain exact under concurrent requests | Must-have | ✅ |
+| R3 | Require no pool, interactive transaction, or runtime timer on Neon HTTP | Must-have | ✅ |
+| R4 | Work in Next.js, Vercel, Bun, Node.js, and edge-compatible runtimes | Must-have | ✅ |
+| R5 | Never create or migrate tables during a request | Must-have | ✅ |
+| R6 | Expose explicit fail-open and fail-closed policies | Must-have | ✅ |
+| R7 | Return `success`, `remaining`, `reset`, and `limit` | Must-have | ✅ |
+| R8 | Support isolated integration tests against real Neon branches | Must-have | ✅ |
+| R9 | Keep public high-volume edge limiting outside Postgres | Must-have | ✅ |
+| R10 | Ship flexible fixed window in the first release | Must-have | ✅ |
+| R11 | Preserve a storage-agnostic core for later adapters | Must-have | ✅ |
+| R12 | Add agent identity, Redis, and additional algorithms only after dogfooding | Nice-to-have | ✅ |
 
-### Surface (from Shape C — forget-about-it)
-- **`by.*` identity helpers**: `by.ip`, `by.user`, `by.apiKey`, **`by.agent`**
-  (x-agent-id header / MCP session id / UA fingerprint), `by.fallback(...)`,
-  `by.header(...)`, `by.custom(...)`. `by.agent` is the differentiator.
-- **Loud failure for the serverless-memory footgun**: `memory()` throws at
-  construction if it detects a serverless runtime (AWS_LAMBDA / VERCEL / CF
-  Workers) unless `allowInServerless: true`. Backstop in the `Limiter`
-  constructor via `storage.distributed: boolean`. The classic silent
-  "effective limit × N instances" abuse bug becomes a boot-time crash with a
-  copy-pasteable fix.
+## Breadboard
 
-### Rejected (from Shape A)
-- The dual `compute` closure + declarative `recipe` (algorithm written twice,
-  JS + recipe-to-Lua). Premature complexity for v0.1. If a user ever needs
-  1-round-trip Redis, the Redis adapter drops to Lua internally without forcing
-  every algorithm to be authored twice.
-
-## Public API (target)
-
-```ts
-import { Limiter, tokenBucket, by } from "@crafter/limit";
-import { redis } from "@crafter/limit/redis";
-import { memory } from "@crafter/limit/memory";
-
-const limiter = new Limiter({
-  storage: redis({ url: process.env.REDIS_URL! }),
-  limit: tokenBucket(10, "10s"),
-  key: by.agent,            // <- the differentiator. default: by.ip
-  prefix: "api",            // optional
-});
-
-const { success, remaining, reset, limit } = await limiter.limit(agentId);
-if (!success) return new Response("rate limited", { status: 429 });
+```text
+request
+  -> Limiter.limit(subject)
+  -> prefix + subject
+  -> fixedWindow.step(now)
+     -> pure reducer
+     -> fixed-window recipe
+  -> storage.transition(key, step)
+     -> memory: per-key lock + reducer
+     -> neonHttp: atomic SQL recipe
+  -> RateLimitResult
+  -> application allows request or returns 429
 ```
 
-Swapping `redis(...)` -> `memory(...)` -> `dynamodb(...)` is a one-line change;
-the `await limiter.limit(...)` call site never changes.
+## Decision
 
-## Storage interface (the contract)
-
-```ts
-export interface CounterState {
-  count: number;   // tokens / request count (algorithm-defined)
-  ts: number;      // last-update epoch ms
-  prev?: number;   // reserved now for sliding-window 2-counter (no future break)
-}
-
-export type Step = (prev: CounterState | null, now: number) =>
-  { next: CounterState; result: RateLimitResult; ttlMs: number };
-
-export interface Storage {
-  kind: string;            // "memory" | "redis" | ... (for loud-failure check)
-  distributed: boolean;    // shared across instances? gates serverless guard
-  transition(key: string, step: Step): Promise<RateLimitResult>;  // THE primitive
-  reset(key: string): Promise<void>;
-  readonly raw: unknown;   // escape hatch to native client
-}
-```
-
-## Roadmap
-
-| Version | Ships |
-|---|---|
-| v0.1 | `Limiter` + `tokenBucket` + `memory()` + `redis()` + `by.*` (incl `by.agent`) + serverless loud-failure + escape hatch |
-| v0.2 | `slidingWindow` (approx 2-counter) + `fixedWindow` + presets + framework middleware (`@crafter/limit/next`, `/hono`, `/express`) |
-| v0.3 | `postgres()` adapter |
-| v0.4 | `dynamodb()` + `durableObject()` adapters |
-
-`redis()` alone makes it "agnostic to AWS/GCP/Vercel/Azure" — they all offer
-managed Redis. No need to ship N cloud adapters; ship N *store* adapters.
-
-## Open decisions (for PRD / scaffold)
-
-1. Package name: `@crafter/limit` vs `@crafter/ratelimit`. (Leaning `@crafter/limit`.)
-2. `slidingWindow` precise vs approximated in v0.2. (Approximated keeps the
-   single-primitive interface; recommend approximated.)
-3. Conformance test suite every adapter must pass (race test under concurrency).
-   Build this in v0.1 so adapter authors have a correctness gate.
-
-## Prior context
-
-- Files SDK reference: https://files-sdk.dev/
-- Upstash ratelimit: https://github.com/upstash/ratelimit-js
-- Unkey serverless exit: https://www.unkey.com/blog/serverless-exit
-- 3-shape design pass outputs: this conversation, 2026-05-30.
+Shape C was selected on 2026-08-30. The previous Redis-first sequence is superseded. The first production release is Neon HTTP-first and must be dogfooded in Petdex before another distributed adapter is added.

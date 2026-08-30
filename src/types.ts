@@ -30,10 +30,29 @@ export interface RateLimitResult {
  * result, and a TTL hint for idle-key eviction. No I/O, no clock reads inside.
  * This IS the entire algorithm.
  */
-export type Step = (
-  prev: CounterState | null,
-  now: number,
-) => { next: CounterState; result: RateLimitResult; ttlMs: number };
+export interface FixedWindowRecipe {
+  readonly kind: "fixed-window";
+  readonly limit: number;
+  readonly now: number;
+  readonly windowMs: number;
+}
+
+export interface TokenBucketRecipe {
+  readonly kind: "token-bucket";
+  readonly limit: number;
+  readonly now: number;
+  readonly windowMs: number;
+}
+
+export type TransitionRecipe = FixedWindowRecipe | TokenBucketRecipe;
+
+export interface Step {
+  (
+    prev: CounterState | null,
+    now: number,
+  ): { next: CounterState; result: RateLimitResult; ttlMs: number };
+  readonly recipe: TransitionRecipe;
+}
 
 /**
  * THE storage primitive. Adapters implement exactly this surface.

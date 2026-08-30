@@ -1,4 +1,4 @@
-import type { Algorithm, Duration } from "./types.js";
+import type { Algorithm, CounterState, Duration, Step } from "./types.js";
 
 const UNIT_MS: Record<string, number> = {
   ms: 1,
@@ -17,24 +17,90 @@ export function parseDuration(d: Duration): number {
   return value * factor;
 }
 
-/**
- * Token bucket: `tokens` capacity, fully refilled every `window`. Continuous
- * lazy refill (fractional tokens accrue per ms), no background job.
- *
- * TODO(RL-1): implement step(now) returning the pure transition. The reducer:
- *  - reconstruct current token level from prev (full bucket if prev is null)
- *  - refill = min(capacity, prev.count + elapsed * (tokens / windowMs))
- *  - allowed = refilled >= 1; nextCount = allowed ? refilled - 1 : refilled
- *  - reset = now + ceil((capacity - nextCount) / ratePerMs)
- *  - ttlMs = windowMs * 2
- */
 export function tokenBucket(tokens: number, window: Duration): Algorithm {
   const windowMs = parseDuration(window);
-  void windowMs;
+  if (!Number.isFinite(tokens) || tokens <= 0) {
+    throw new Error(`invalid token capacity: ${tokens}`);
+  }
+  if (!Number.isFinite(windowMs) || windowMs <= 0) {
+    throw new Error(`invalid duration: ${window}`);
+  }
+  const ratePerMs = tokens / windowMs;
+
+  const reduce = (prev: CounterState | null, now: number) => {
+    const current = prev
+      ? Math.min(tokens, prev.count + Math.max(0, now - prev.ts) * ratePerMs)
+      : tokens;
+    const success = current >= 1;
+    const nextCount = success ? current - 1 : current;
+    const reset = now + Math.ceil((tokens - nextCount) / ratePerMs);
+
+    return {
+      next: { count: nextCount, ts: now },
+      result: {
+        success,
+        remaining: Math.max(0, Math.floor(nextCount)),
+        reset,
+        limit: tokens,
+      },
+      ttlMs: windowMs * 2,
+    };
+  };
+
   return {
     limit: tokens,
-    step(_now: number) {
-      throw new Error("not implemented: tokenBucket.step (RL-1)");
+    step(now: number) {
+      return Object.assign(
+        (prev: CounterState | null, transitionNow = now) =>
+          reduce(prev, transitionNow),
+        {
+          recipe: {
+            kind: "token-bucket",
+            limit: tokens,
+            now,
+            windowMs,
+          } as const,
+        },
+      );
     },
+  };
+}
+
+export function fixedWindow(requests: number, window: Duration): Algorithm {
+  const windowMs = parseDuration(window);
+  if (!Number.isSafeInteger(requests) || requests <= 0) {
+    throw new Error(`invalid request limit: ${requests}`);
+  }
+
+  const makeStep = (now: number): Step =>
+    Object.assign(
+      (prev: CounterState | null, transitionNow = now) => {
+        const expired = !prev || prev.ts + windowMs <= transitionNow;
+        const windowStartedAt = expired ? transitionNow : prev.ts;
+        const count = expired ? 1 : Math.min(prev.count + 1, requests + 1);
+        return {
+          next: { count, ts: windowStartedAt },
+          result: {
+            success: count <= requests,
+            remaining: Math.max(0, requests - count),
+            reset: windowStartedAt + windowMs,
+            limit: requests,
+          },
+          ttlMs: windowMs * 2,
+        };
+      },
+      {
+        recipe: {
+          kind: "fixed-window",
+          limit: requests,
+          now,
+          windowMs,
+        } as const,
+      },
+    );
+
+  return {
+    limit: requests,
+    step: makeStep,
   };
 }
